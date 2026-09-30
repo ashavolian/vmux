@@ -1,0 +1,1400 @@
+#!/usr/bin/env python3
+"""
+vmux — a picker for Claude Code tmux sessions on a remote machine.
+
+Bare `vmux` always opens the picker, whatever is running.
+
+Creating a session with a blank name gives it a throwaway timestamp name, and a
+watcher on the remote machine renames it to match Claude's own session title
+once Claude has something to call it.
+
+Attachments survive a closed laptop: when the SSH transport dies, vmux waits
+for the host to come back and re-attaches. The tmux session on the remote
+machine keeps running the whole time, so a Claude job started before the lid
+closed is still going (with its scrollback) when you reattach.
+
+Everything machine-specific — the host, how to start a stopped VM, how to log
+in again — lives in a config file written by `vmux setup`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import curses
+import datetime as dt
+import fcntl
+import getpass
+import json
+import locale
+import os
+import re
+import secrets
+import shlex
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+
+# -------------------------------------------------------------- configuration
+#
+# Everything machine-specific lives in a JSON file written by `vmux setup`, so
+# the script itself carries no hostnames or site-specific commands. Any string
+# value may contain {user}, which becomes the local username at load time.
+
+CONFIG_ENV = "VMUX_CONFIG"
+
+
+def default_config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "vmux", "config.json")
+
+
+@dataclass
+class Config:
+    # Anything ssh accepts, including an ssh_config alias.
+    host: str = ""
+    # Working directory for new sessions. Expanded by the *remote* shell, so it
+    # is deliberately inserted unquoted where it's used.
+    workdir: str = "$HOME"
+    # Passed as `claude --model`; blank lets Claude Code pick its own default.
+    claude_model: str = ""
+    # Appended verbatim to the claude command, e.g. "--permission-mode auto".
+    claude_flags: str = ""
+    # Optional VM control for hosts that get shut down. status_command runs
+    # locally; its stdout is matched against the two patterns. If neither
+    # matches, the state is unknown and vmux never runs start_command.
+    vm_status_command: str = ""
+    vm_running_pattern: str = ""
+    vm_stopped_pattern: str = ""
+    vm_start_command: str = ""
+    # Shown (never run) when ssh authentication fails, e.g. an SSO login.
+    login_command: str = ""
+    # Extra ssh stderr substrings that mean "retrying won't help", plus a hint
+    # to print when one is seen.
+    auth_fatal_markers: list = field(default_factory=list)
+    auth_fatal_hint: str = ""
+
+    @property
+    def has_vm_control(self) -> bool:
+        return bool(self.vm_status_command)
+
+
+CONFIG_FIELDS = tuple(Config.__dataclass_fields__)
+COMMAND_FIELDS = ("vm_status_command", "vm_start_command")
+LIST_FIELDS = ("auth_fatal_markers",)
+
+
+def expand_user_placeholder(value, quoted: bool):
+    """Substitute {user}. In shell command fields the name is quoted so it is
+    always a single word; everywhere else it is inserted as-is."""
+    user = getpass.getuser()
+    rep = shlex.quote(user) if quoted else user
+    if isinstance(value, str):
+        return value.replace("{user}", rep)
+    if isinstance(value, list):
+        return [v.replace("{user}", rep) if isinstance(v, str) else v for v in value]
+    return value
+
+
+def load_config(path: str) -> Config | None:
+    """The config, or None if the file doesn't exist. Malformed files exit."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        sys.exit(f"{RED}✖{RESET} can't read {path}: {exc}")
+    return parse_config(raw, path)
+
+
+def parse_config(raw, path: str) -> Config:
+    """Validate and expand a decoded config; exits with a message if it's bad."""
+    if not isinstance(raw, dict):
+        sys.exit(f"{RED}✖{RESET} {path} should hold a JSON object")
+
+    known = {}
+    for key, value in raw.items():
+        if key not in CONFIG_FIELDS:
+            print(f"{YELLOW}▸{RESET} {path}: ignoring unknown key {key!r}")
+            continue
+        if key in LIST_FIELDS:
+            ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+        else:
+            ok = isinstance(value, str)
+        if not ok:
+            want = "a list of strings" if key in LIST_FIELDS else "a string"
+            sys.exit(f"{RED}✖{RESET} {path}: {key} must be {want}")
+        known[key] = expand_user_placeholder(value, quoted=key in COMMAND_FIELDS)
+    cfg = Config(**known)
+    for name in ("vm_running_pattern", "vm_stopped_pattern"):
+        pattern = getattr(cfg, name)
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                sys.exit(f"{RED}✖{RESET} {path}: {name} is not a valid regex: {exc}")
+    return cfg
+
+
+def save_config(path: str, cfg: Config) -> None:
+    """Write with owner-only permissions; the file holds commands vmux will run."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    data = {k: getattr(cfg, k) for k in CONFIG_FIELDS}
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(path, 0o600)
+
+
+# Set once in main(); every ssh/VM helper reads from here.
+CFG = Config()
+
+PREFIX = "claude-"
+WATCH_PATH = "$HOME/.cache/vmux-watch.sh"
+
+# Lives on the VM's disk (which survives a stop) rather than the laptop, so it
+# sits next to the conversations it points at and works from any machine.
+STATE_DIR = "$HOME/.local/state/vmux"
+STATE_FILE = "$HOME/.local/state/vmux/sessions.json"
+STATE_MARK = "---VMUX-STATE---"
+AUTO_STAMP = "%m%d-%H%M%S"  # the glob in WATCHER_SH must match this shape
+
+# ServerAlive* is what turns a slept-through connection into a prompt 255
+# instead of a socket that hangs until the kernel gives up on the TCP window.
+SSH_OPTS = [
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=5",
+    "-o", "ServerAliveCountMax=3",
+]
+
+SSH_TRANSPORT_ERROR = 255
+MAX_BACKOFF = 30
+AUTH_FAIL_LIMIT = 3
+CERT_WARN_SECONDS = 5 * 60
+VM_RECHECK_SECONDS = 60       # re-sample VM state while waiting, not just once
+VM_START_ATTEMPTS = 2         # a VM that won't stay RUNNING is a real problem
+WAIT_GIVE_UP_SECONDS = 12 * 60
+
+NAME_CHARS = frozenset(string.ascii_letters + string.digits + "-_")
+MAX_NAME = 64
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+
+class TransportError(Exception):
+    """SSH could not reach the host at all."""
+
+
+@dataclass
+class Session:
+    name: str
+    windows: int
+    attached: bool
+    idle: int  # seconds since last activity, per the VM's own clock
+    claude_id: str = ""  # Claude conversation uuid, from @vmux_claude
+
+    @property
+    def is_claude(self) -> bool:
+        return self.name.startswith(PREFIX)
+
+
+# ---------------------------------------------------------------- ssh plumbing
+
+
+def ssh_capture(remote: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a remote command, capturing output. Never uses a shell locally."""
+    return subprocess.run(
+        ["ssh", *SSH_OPTS, CFG.host, remote],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def ssh_probe() -> tuple[bool, str]:
+    """Cheap reachability check. Returns (ok, stderr)."""
+    try:
+        cp = subprocess.run(
+            ["ssh", *SSH_OPTS, "-o", "BatchMode=yes", CFG.host, "true"],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    return cp.returncode == 0, cp.stderr.strip()
+
+
+def is_auth_error(stderr: str) -> bool:
+    low = stderr.lower()
+    return any(
+        marker in low
+        for marker in ("permission denied", "publickey", "no such identity", "certificate")
+    )
+
+
+def is_auth_infra_error(stderr: str) -> bool:
+    """The login machinery itself failed in a way retrying won't fix — most
+    often a local port another ssh is still holding. Sites add their own
+    markers in the config."""
+    low = stderr.lower()
+    markers = ["address already in use", *CFG.auth_fatal_markers]
+    return any(marker.lower() in low for marker in markers)
+
+
+def is_host_unresolvable(stderr: str) -> bool:
+    """A stopped cloud VM often loses its DNS record, so this fails in
+    milliseconds — far cheaper than waiting out a ConnectTimeout."""
+    low = stderr.lower()
+    return any(
+        marker in low
+        for marker in (
+            "could not resolve hostname",
+            "name or service not known",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+        )
+    )
+
+
+def cert_seconds_left() -> int | None:
+    """Seconds until the SSH certificate in the agent expires, or None if unknown."""
+    listed = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
+    if listed.returncode != 0:
+        return None
+    line = next((l for l in listed.stdout.splitlines() if "-cert-" in l), None)
+    if not line:
+        return None
+
+    fd, path = tempfile.mkstemp(suffix=".pub")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(line + "\n")
+        info = subprocess.run(
+            ["ssh-keygen", "-L", "-f", path], capture_output=True, text=True
+        )
+    finally:
+        os.unlink(path)
+
+    for raw in info.stdout.splitlines():
+        field = raw.strip()
+        if not field.startswith("Valid:"):
+            continue
+        parts = field.split()
+        if "to" not in parts:
+            return None
+        stamp = parts[parts.index("to") + 1]
+        try:
+            expiry = dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+        return int((expiry - dt.datetime.now()).total_seconds())
+    return None
+
+
+RECOVERY_LOCK = os.path.expanduser("~/.cache/vmux/recovery.lock")
+
+
+@contextlib.contextmanager
+def recovery_lock():
+    """Single-flight guard for VM status/start across concurrent vmux tabs.
+
+    Each tab otherwise runs the status/start commands (and, through ssh, any
+    SSO login flow) on its own schedule; N tabs stampede those shared
+    resources. Yields True to the one instance that should drive recovery and
+    False to the rest, who just keep probing.
+
+    Deliberately scoped to the VM commands only — never held across an
+    interactive attach — so a long-lived holder can't keep other tabs offline.
+    """
+    os.makedirs(os.path.dirname(RECOVERY_LOCK), exist_ok=True)
+    handle = open(RECOVERY_LOCK, "w")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        handle.close()  # releases the flock
+
+
+def vm_status() -> tuple[str | None, str]:
+    """('running' | 'stopped' | None, detail) per the configured status command.
+
+    None means the state couldn't be read — the command failed, timed out, or
+    printed something neither pattern recognises. Unknown is never treated as
+    stopped: starting an already-running VM is the one mistake to avoid.
+    """
+    if not CFG.has_vm_control:
+        return None, "no vm_status_command configured"
+    try:
+        cp = subprocess.run(
+            CFG.vm_status_command, shell=True,
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "status command timed out"
+    out = cp.stdout
+    for state, pattern in (("running", CFG.vm_running_pattern),
+                           ("stopped", CFG.vm_stopped_pattern)):
+        if not pattern:
+            continue
+        m = re.search(pattern, out, re.M)
+        if m:
+            detail = m.group(m.lastindex) if m.lastindex else m.group(0)
+            return state, detail.strip()
+    reason = cp.stderr.strip() or "no recognised state in its output"
+    return None, reason.splitlines()[-1][:120]
+
+
+def vm_start() -> bool:
+    """Run the start command and let its own output through — it can take a
+    while and silence would look like a hang."""
+    cp = subprocess.run(CFG.vm_start_command, shell=True)
+    return cp.returncode == 0
+
+
+def report_auth_failure() -> None:
+    left = cert_seconds_left()
+    print(f"{RED}✖{RESET} SSH auth is failing", end="")
+    if left is not None and left <= 0:
+        print(" — your SSH certificate has expired.")
+    else:
+        print(".")
+    if CFG.login_command:
+        print(f"  Re-authenticate, then rerun vmux:  {DIM}{CFG.login_command}{RESET}")
+    else:
+        print(f"  Check that {DIM}ssh {CFG.host}{RESET} works on its own, then rerun vmux.")
+
+
+# ------------------------------------------------------------------ tmux verbs
+
+LIST_FMT = (
+    "#{session_name}\t#{session_windows}\t#{session_attached}"
+    "\t#{session_activity}\t#{@vmux_claude}"
+)
+# One round trip for everything: the VM's clock first, so idle times don't drift
+# with local skew, then the live sessions, then the persisted records.
+SNAPSHOT_CMD = (
+    "date +%s; "
+    f"tmux list-sessions -F {shlex.quote(LIST_FMT)} 2>/dev/null || true; "
+    f"echo {STATE_MARK}; "
+    f"cat {STATE_FILE} 2>/dev/null || true"
+)
+
+
+def snapshot() -> tuple[list[Session], list[dict]]:
+    """Live sessions plus the records of what vmux has created before."""
+    cp = ssh_capture(SNAPSHOT_CMD)
+    if cp.returncode != 0:
+        raise TransportError(cp.stderr.strip() or f"ssh exited {cp.returncode}")
+
+    head, _, tail = cp.stdout.partition(STATE_MARK + "\n")
+    lines = head.splitlines()
+    if not lines:
+        return [], []
+    try:
+        remote_now = int(lines[0].strip())
+    except ValueError:
+        remote_now = int(time.time())
+
+    sessions = []
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        name, windows, attached, activity, claude_id = parts
+        try:
+            sessions.append(
+                Session(
+                    name=name,
+                    windows=int(windows),
+                    attached=attached.strip() not in ("", "0"),
+                    idle=max(0, remote_now - int(activity)),
+                    claude_id=claude_id.strip(),
+                )
+            )
+        except ValueError:
+            continue
+    # Claude sessions first, then most recently active.
+    sessions.sort(key=lambda s: (not s.is_claude, s.idle))
+
+    records: list[dict] = []
+    if tail.strip():
+        try:
+            parsed = json.loads(tail)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            records = [r for r in parsed if isinstance(r, dict)]
+    return sessions, records
+
+
+def save_records(records: list[dict]) -> None:
+    """Best-effort: losing this only costs a future restore, not the session."""
+    try:
+        subprocess.run(
+            ["ssh", *SSH_OPTS, CFG.host, f"mkdir -p {STATE_DIR} && cat > {STATE_FILE}"],
+            input=json.dumps(records, indent=2),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def reconcile(
+    sessions: list[Session], records: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Split records into (still alive, needs restoring).
+
+    Matched on the Claude id carried in @vmux_claude rather than on the name, so
+    the auto-rename watcher can't make a live session look missing.
+    """
+    live = {s.claude_id: s for s in sessions if s.claude_id}
+    alive: list[dict] = []
+    missing: list[dict] = []
+    for rec in records:
+        cid = rec.get("claude_id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        found = live.get(cid)
+        if found:
+            rec["name"] = found.name  # follow renames
+            alive.append(rec)
+        else:
+            missing.append(rec)
+    return alive, missing
+
+
+def valid_name(name: str) -> bool:
+    return 0 < len(name) <= MAX_NAME and set(name) <= NAME_CHARS
+
+
+def normalize_name(raw: str) -> str:
+    name = raw.strip()
+    return name if name.startswith(PREFIX) else PREFIX + name
+
+
+# Runs on the remote machine, not here. Polling #{pane_title} from the laptop
+# would mean a fresh SSH — and any SSO login that triggers — every few seconds;
+# this costs one connection total and then polls locally for free.
+WATCHER_SH = """#!/bin/sh
+# Written by vmux. Renames an auto-named Claude session once Claude Code sets a
+# task-specific terminal title. Safe to delete.
+id="$1"
+i=0
+while [ "$i" -lt 180 ]; do
+    i=$((i + 1))
+    sleep 5
+
+    # Resolve by id, not name, so a rename can't lose track of the session.
+    cur=$(tmux list-sessions -F '#{session_name} #{@vmux_id}' 2>/dev/null \
+          | awk -v want="$id" '$2 == want { print $1; exit }')
+    [ -n "$cur" ] || exit 0
+
+    # If it no longer looks auto-named, someone renamed it on purpose. Back off.
+    case "$cur" in
+        claude-[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *) exit 0 ;;
+    esac
+
+    title=$(tmux display-message -p -t "$cur" '#{pane_title}' 2>/dev/null)
+    slug=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
+           | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)
+    case "$slug" in
+        '' | claude-code) continue ;;   # still the placeholder title; keep waiting
+    esac
+
+    new="claude-$slug"
+    [ "$new" = "$cur" ] && exit 0
+
+    cand="$new"
+    k=2
+    while tmux has-session -t "=$cand" 2>/dev/null; do
+        cand="$new-$k"
+        k=$((k + 1))
+        [ "$k" -gt 20 ] && exit 0
+    done
+
+    tmux rename-session -t "$cur" "$cand"
+    exit 0
+done
+"""
+
+
+def auto_name() -> str:
+    return PREFIX + dt.datetime.now().strftime(AUTO_STAMP)
+
+
+def start_watcher(token: str) -> None:
+    """Install the watcher and detach it. Best-effort: a failure here only
+    costs the auto-rename, so the session is still perfectly usable."""
+    launch = (
+        f"mkdir -p $HOME/.cache && cat > {WATCH_PATH} && chmod +x {WATCH_PATH}; "
+        f"setsid {WATCH_PATH} {shlex.quote(token)} </dev/null >/dev/null 2>&1 &"
+    )
+    try:
+        subprocess.run(
+            ["ssh", *SSH_OPTS, CFG.host, launch],
+            input=WATCHER_SH,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def resolve_claude(claude_id: str) -> str | None:
+    """Find a session by its Claude id, which survives renaming."""
+    cp = ssh_capture(
+        "tmux list-sessions -F " + shlex.quote("#{session_name} #{@vmux_claude}")
+    )
+    if cp.returncode != 0:
+        return None
+    for line in cp.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == claude_id:
+            return parts[0]
+    return None
+
+
+def claude_cmd(claude_id: str, resume: bool) -> str:
+    """Pinning the id up front is what makes a later --resume deterministic.
+
+    The model id is quoted separately because send-keys *types* this line into
+    an interactive shell: an id like `foo[1m]` would otherwise be read as a
+    glob pattern and the command dies with "no matches found". Quoting the
+    whole line for ssh (as spawn_session does) does not protect this inner
+    shell.
+    """
+    flag = "--resume" if resume else "--session-id"
+    parts = [f"claude {flag} {claude_id}"]
+    if CFG.claude_model:
+        parts.append(f"--model {shlex.quote(CFG.claude_model)}")
+    if CFG.claude_flags:
+        parts.append(CFG.claude_flags)
+    return " ".join(parts)
+
+
+def spawn_session(
+    name: str,
+    claude_id: str,
+    *,
+    resume: bool = False,
+    cwd_expr: str | None = None,
+    auto_rename: bool = False,
+) -> tuple[str | None, str]:
+    """Create a detached session and start (or resume) Claude in it.
+
+    The pane runs a login shell (tmux's default), which is what puts `claude`
+    on PATH. Claude is started with send-keys rather than as
+    the pane command so the shell outlives it — when a job finishes the window
+    stays put with its output instead of the session evaporating.
+
+    `cwd_expr` is inserted into the remote command as-is, so callers pass either
+    an unquoted shell expression (the configured workdir by default) or a
+    shlex.quote'd absolute path.
+
+    Returns (watcher token or None, resolved absolute cwd).
+    """
+    if cwd_expr is None:
+        cwd_expr = CFG.workdir
+    q = shlex.quote(name)
+    inner = claude_cmd(claude_id, resume)
+    remote = (
+        f"tmux new-session -d -s {q} -c {cwd_expr} && "
+        f"tmux set-option -t {q} @vmux_claude {shlex.quote(claude_id)} && "
+        f"tmux send-keys -t {q} {shlex.quote(inner)} C-m"
+    )
+    token = secrets.token_hex(8) if auto_rename else None
+    if token:
+        remote += f" && tmux set-option -t {q} @vmux_id {shlex.quote(token)}"
+    # Report the real path back so the record can be restored anywhere later.
+    remote += f" && tmux display-message -p -t {q} '#{{pane_current_path}}'"
+
+    cp = ssh_capture(remote)
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.strip() or f"could not create {name}")
+    if token:
+        start_watcher(token)
+    return token, cp.stdout.strip().splitlines()[-1] if cp.stdout.strip() else ""
+
+
+def create_session(name: str, auto_rename: bool = False) -> tuple[str | None, dict]:
+    """Start a fresh Claude session. Returns (watcher token, state record)."""
+    claude_id = str(uuid.uuid4())
+    token, cwd = spawn_session(name, claude_id, auto_rename=auto_rename)
+    return token, {"name": name, "cwd": cwd, "claude_id": claude_id}
+
+
+def restore_session(rec: dict, taken: set[str]) -> dict | None:
+    """Recreate a session the VM shutdown destroyed, resuming its conversation."""
+    claude_id = rec.get("claude_id")
+    cwd = rec.get("cwd") or ""
+    base = rec.get("name") or auto_name()
+    if not isinstance(claude_id, str) or not claude_id:
+        return None
+
+    name = base
+    suffix = 2
+    while name in taken:
+        name = f"{base}-{suffix}"
+        suffix += 1
+
+    cwd_expr = shlex.quote(cwd) if cwd.startswith("/") else CFG.workdir
+    try:
+        spawn_session(name, claude_id, resume=True, cwd_expr=cwd_expr)
+    except RuntimeError as exc:
+        print(f"{RED}✖{RESET} {base}: {exc}")
+        return None
+    taken.add(name)
+    return {"name": name, "cwd": cwd, "claude_id": claude_id}
+
+
+def restore_missing(missing: list[dict], live: list[Session]) -> list[dict]:
+    """Bring back everything the shutdown took. Returns the new records."""
+    plural = "session" if len(missing) == 1 else "sessions"
+    print(f"{YELLOW}▸{RESET} {len(missing)} {plural} did not survive the VM "
+          f"restart; restoring")
+    taken = {s.name for s in live}
+    restored = []
+    for rec in missing:
+        new = restore_session(rec, taken)
+        if new:
+            short = new["claude_id"][:8]
+            print(f"  {GREEN}✔{RESET} {new['name']}  {DIM}resuming {short}{RESET}")
+            restored.append(new)
+    return restored
+
+
+def create_plain_session(name: str) -> None:
+    q = shlex.quote(name)
+    cp = ssh_capture(f"tmux new-session -d -s {q} -c {CFG.workdir}")
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.strip() or f"could not create {name}")
+
+
+def kill_session(name: str) -> None:
+    cp = ssh_capture(f"tmux kill-session -t {shlex.quote(name)}")
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.strip() or f"could not kill {name}")
+
+
+def rename_session(old: str, new: str) -> None:
+    cp = ssh_capture(
+        f"tmux rename-session -t {shlex.quote(old)} {shlex.quote(new)}"
+    )
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.strip() or f"could not rename {old}")
+
+
+# ------------------------------------------------------- attach + reconnect
+
+
+def ssh_attach(name: str) -> int:
+    """Interactive attach. Inherits the tty; returns ssh's exit status.
+
+    `attach -d` evicts any other client. After a lid close the pre-sleep client
+    often lingers server-side until its TCP dies, and tmux would otherwise
+    shrink the window to that ghost's dimensions.
+    """
+    return subprocess.call(
+        ["ssh", "-t", *SSH_OPTS, CFG.host, f"tmux attach -d -t {shlex.quote(name)}"]
+    )
+
+
+def countdown(seconds: int, message: str) -> None:
+    """Sleep with a spinner, leaving the line clean afterwards."""
+    end = time.monotonic() + seconds
+    frame = 0
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        glyph = SPINNER[frame % len(SPINNER)]
+        sys.stdout.write(f"\r{DIM}  {message} {int(left) + 1}s {glyph}{RESET}\033[K")
+        sys.stdout.flush()
+        frame += 1
+        time.sleep(0.1)
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+def wait_for_host() -> bool:
+    """Block until the host answers, starting the VM if it has been shut down.
+
+    Reached both on a cold start and after a lid close — an idle cloud VM can
+    auto-terminate while the laptop sleeps, so waking up needs the same
+    start-it-and-wait path as a cold start.
+
+    State is re-checked on a timer rather than once. A cloud API can still
+    report running while the guest is already shutting down, so a wait that
+    sampled the state a single time would sit there forever as the VM went
+    down underneath it.
+    """
+    delay = 2
+    auth_failures = 0
+    start_attempts = 0
+    last_vm_check = 0.0
+    last_state_shown = None
+    began = time.monotonic()
+
+    while True:
+        ok, err = ssh_probe()
+        if ok:
+            return True
+
+        if is_auth_infra_error(err):
+            # Retrying cannot free a port another process owns, and each retry
+            # keeps it contended. Bail and say what we saw.
+            last = err.strip().splitlines()[-1] if err.strip() else "unknown error"
+            print(f"{RED}✖{RESET} ssh login can't complete: {last}")
+            print(f"  Usually another ssh or vmux is still holding a local "
+                  f"port; stop it, then rerun.")
+            if CFG.auth_fatal_hint:
+                print(f"  {DIM}{CFG.auth_fatal_hint}{RESET}")
+            return False
+
+        if is_auth_error(err):
+            auth_failures += 1
+            if auth_failures >= AUTH_FAIL_LIMIT:
+                report_auth_failure()
+                return False
+        elif CFG.has_vm_control:
+            now = time.monotonic()
+            # First failure checks immediately, then at most once a minute —
+            # status commands tend to be slow and this runs inside a retry loop.
+            if last_vm_check == 0.0 or now - last_vm_check >= VM_RECHECK_SECONDS:
+                last_vm_check = now
+                with recovery_lock() as held:
+                    # Another tab is already driving recovery; don't duplicate
+                    # its VM commands, just keep probing.
+                    state, detail = vm_status() if held else ("running", "")
+
+                if state is None:
+                    # Couldn't read the state. Unknown is NOT stopped: starting
+                    # here would fire at an already-running VM.
+                    if last_state_shown != "unknown":
+                        last_state_shown = "unknown"
+                        print(f"{YELLOW}▸{RESET} can't read the VM state "
+                              f"({detail}); still waiting, not starting it — "
+                              f"it may already be running")
+                elif state == "stopped":
+                    label = detail or "stopped"
+                    if not CFG.vm_start_command:
+                        if last_state_shown != "stopped":
+                            last_state_shown = "stopped"
+                            print(f"{YELLOW}▸{RESET} VM is {label} and no "
+                                  f"vm_start_command is configured; start it "
+                                  f"yourself and vmux will attach when it answers")
+                    elif start_attempts >= VM_START_ATTEMPTS:
+                        print(f"{RED}✖{RESET} the VM keeps leaving the running "
+                              f"state (now {label}) after {start_attempts} start "
+                              f"attempts. Giving up.")
+                        return False
+                    else:
+                        start_attempts += 1
+                        print(f"{YELLOW}▸{RESET} VM is {label}; running "
+                              f"{DIM}{CFG.vm_start_command}{RESET}")
+                        if not vm_start():
+                            print(f"{RED}✖{RESET} the start command failed. If "
+                                  f"it asked you to log in somewhere, finish "
+                                  f"that and rerun vmux.")
+                            return False
+                        last_state_shown = None
+                        delay = 2  # sshd needs a moment past "running"
+                        continue
+                elif last_state_shown != state:
+                    last_state_shown = state
+                    print(f"{YELLOW}▸{RESET} VM is running but not answering yet")
+
+        waited = time.monotonic() - began
+        if waited > WAIT_GIVE_UP_SECONDS:
+            print(f"{RED}✖{RESET} still no answer after {int(waited // 60)}m. "
+                  f"Last error: {err or 'none'}")
+            print(f"  Try {DIM}ssh {CFG.host}{RESET} directly to see the real "
+                  f"failure.")
+            return False
+
+        countdown(delay, "waiting for the host")
+        delay = min(delay * 2, MAX_BACKOFF)
+
+
+def attach_with_reconnect(name: str, claude_id: str | None = None) -> None:
+    """Attach, and keep re-attaching for as long as the drop looks like sleep.
+
+    `claude_id` lets the name be re-resolved rather than assumed, since the
+    VM-side watcher may rename the session mid-flight.
+    """
+    announce = False
+    while True:
+        if announce:
+            print(f"{GREEN}✔{RESET} reattached to {name}")
+            announce = False
+
+        started = time.monotonic()
+        rc = ssh_attach(name)
+        lasted = time.monotonic() - started
+
+        if rc == 0:
+            return  # clean detach (prefix-d) or the session ended
+        if rc != SSH_TRANSPORT_ERROR:
+            # Most likely the watcher renamed it between listing and attaching.
+            if claude_id:
+                renamed = resolve_claude(claude_id)
+                if renamed and renamed != name:
+                    print(f"{DIM}  renamed to {renamed}{RESET}")
+                    name = renamed
+                    continue
+            # Negative rc means ssh itself took a signal — the terminal is
+            # going away, so reconnecting into nothing would be wrong.
+            print(f"{RED}✖{RESET} tmux exited with status {rc}.")
+            return
+
+        # Deliberately not guessing a cause here — a lid close and a VM shutdown
+        # look identical from this side. wait_for_host names it.
+        if lasted > 5:
+            print(f"\n{YELLOW}▸{RESET} [{name}] connection dropped")
+        else:
+            print(f"{YELLOW}▸{RESET} [{name}] cannot reach the host")
+        try:
+            if not wait_for_host():
+                return
+        except KeyboardInterrupt:
+            print(f"\n{DIM}  gave up reconnecting; session {name} is still "
+                  f"running on the host{RESET}")
+            return
+
+        if claude_id:
+            renamed = resolve_claude(claude_id)
+            if renamed:
+                name = renamed
+        announce = True
+
+
+# ------------------------------------------------------------------ curses UI
+
+KEY_ESC = 27
+
+
+def _prompt(stdscr, label: str, initial: str = "") -> str | None:
+    """Read a line at the bottom of the screen. None means cancelled."""
+    buf = list(initial)
+    height, width = stdscr.getmaxyx()
+    curses.curs_set(1)
+    try:
+        while True:
+            text = f" {label}{''.join(buf)}"
+            stdscr.move(height - 1, 0)
+            stdscr.clrtoeol()
+            stdscr.addnstr(height - 1, 0, text, width - 1, curses.A_BOLD)
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (curses.KEY_ENTER, 10, 13):
+                return "".join(buf).strip()
+            if ch == KEY_ESC:
+                return None
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if buf:
+                    buf.pop()
+            elif 32 <= ch < 127:
+                if len(buf) < MAX_NAME:
+                    buf.append(chr(ch))
+    finally:
+        curses.curs_set(0)
+        stdscr.move(height - 1, 0)
+        stdscr.clrtoeol()
+
+
+def _confirm(stdscr, question: str) -> bool:
+    height, width = stdscr.getmaxyx()
+    stdscr.move(height - 1, 0)
+    stdscr.clrtoeol()
+    stdscr.addnstr(height - 1, 0, f" {question} [y/N]", width - 1, curses.A_BOLD)
+    stdscr.refresh()
+    ch = stdscr.getch()
+    stdscr.move(height - 1, 0)
+    stdscr.clrtoeol()
+    return ch in (ord("y"), ord("Y"))
+
+
+def human_idle(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _draw(stdscr, sessions: list[Session], idx: int, note: str) -> None:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    if width < 24 or height < 8:
+        stdscr.addnstr(0, 0, "terminal too small", max(0, width - 1))
+        stdscr.refresh()
+        return
+    box_w = min(max(46, width - 2), width - 1)
+    inner = box_w - 2
+
+    def line(y, text, attr=curses.A_NORMAL):
+        if 0 <= y < height:
+            stdscr.addnstr(y, 0, text, min(len(text), width - 1), attr)
+
+    top = 0
+    line(top, "┌" + "─" * inner + "┐")
+    header = "  vmux sessions"
+    status = "● connected  "
+    pad = inner - len(header) - len(status)
+    if pad < 1:
+        # Too narrow for both; the title earns the space over the status dot.
+        line(top + 1, "│" + header.ljust(inner)[:inner] + "│")
+    else:
+        line(top + 1, "│" + header + " " * pad + status + "│")
+        if curses.has_colors():
+            stdscr.chgat(top + 1, 1 + len(header) + pad, 1, curses.color_pair(2))
+    line(top + 2, "├" + "─" * inner + "┤")
+
+    row = top + 3
+    if not sessions:
+        line(row, "│" + "  (no sessions yet — press n)".ljust(inner)[:inner] + "│",
+             curses.A_DIM)
+        row += 1
+    else:
+        for i, s in enumerate(sessions):
+            marker = "▸" if i == idx else " "
+            state = "attached" if s.attached else "idle"
+            body = (
+                f" {marker} {s.name[:22]:<22} {s.windows:>2} win  "
+                f"{state} {human_idle(s.idle)}"
+            )
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            if s.is_claude and i != idx and curses.has_colors():
+                attr = curses.color_pair(1)
+            stdscr.addnstr(row, 0, "│", 1)
+            stdscr.addnstr(row, 1, body.ljust(inner)[:inner], inner, attr)
+            stdscr.addnstr(row, 1 + inner, "│", 1)
+            row += 1
+
+    line(row, "├" + "─" * inner + "┤")
+    keys = " ↵ attach  n new  x kill  r rename  g refresh  q quit"
+    line(row + 1, "│" + keys.ljust(inner)[:inner] + "│", curses.A_DIM)
+    line(row + 2, "└" + "─" * inner + "┘")
+
+    if note:
+        line(row + 4, f"  {note}", curses.A_DIM)
+    stdscr.refresh()
+
+
+def picker(stdscr, sessions: list[Session], note: str):
+    """Return an (action, payload) pair. Never attaches from inside curses."""
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    if curses.has_colors():
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+
+    idx = 0
+    while True:
+        idx = max(0, min(idx, len(sessions) - 1)) if sessions else 0
+        _draw(stdscr, sessions, idx, note)
+        ch = stdscr.getch()
+
+        if ch in (ord("q"), KEY_ESC):
+            return ("quit", None)
+        if ch in (curses.KEY_DOWN, ord("j")):
+            if sessions:
+                idx = (idx + 1) % len(sessions)
+        elif ch in (curses.KEY_UP, ord("k")):
+            if sessions:
+                idx = (idx - 1) % len(sessions)
+        elif ch in (ord("g"), curses.KEY_RESIZE):
+            return ("refresh", None)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if sessions:
+                return ("attach", sessions[idx].name)
+        elif ch == ord("n"):
+            raw = _prompt(stdscr, "new session name (blank = name it after Claude): ")
+            if raw is None:
+                continue  # Esc
+            if not raw:
+                return ("new-auto", None)
+            name = normalize_name(raw)
+            if valid_name(name):
+                return ("new", name)
+            note = "names may use letters, digits, - and _ only"
+        elif ch == ord("x"):
+            if sessions:
+                target = sessions[idx].name
+                if _confirm(stdscr, f"kill {target}?"):
+                    return ("kill", target)
+        elif ch == ord("r"):
+            if sessions:
+                old = sessions[idx].name
+                raw = _prompt(stdscr, "rename to: ", old)
+                if raw and raw != old:
+                    if valid_name(raw):
+                        return ("rename", (old, raw))
+                    note = "names may use letters, digits, - and _ only"
+
+
+# ---------------------------------------------------------------------- main
+
+
+def agent_has_cert() -> bool:
+    cp = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
+    return cp.returncode == 0 and any(
+        "-cert-" in line for line in cp.stdout.splitlines()
+    )
+
+
+def preflight() -> None:
+    """Warn about an expiring SSH certificate before a long job, when one is
+    in use. Plain-key setups have nothing to check."""
+    if not agent_has_cert():
+        if CFG.login_command:
+            # Distinct from an expiring cert: there is nothing to expire.
+            print(f"{YELLOW}▸{RESET} no SSH certificate in the agent — you may "
+                  f"need to log in first: {DIM}{CFG.login_command}{RESET}")
+        return
+    left = cert_seconds_left()
+    if left is not None and left <= 0:
+        print(f"{YELLOW}▸{RESET} your SSH certificate has expired; ssh will "
+              f"ask you to re-authenticate.")
+    elif left is not None and left < CERT_WARN_SECONDS:
+        tail = (f" — run {DIM}{CFG.login_command}{RESET} first" if CFG.login_command
+                else " — renew it first")
+        print(f"{YELLOW}▸{RESET} your SSH certificate expires in "
+              f"{human_idle(left)}{tail} if you're starting a long job.")
+
+
+def fetch() -> tuple[list[Session], list[dict]]:
+    try:
+        return snapshot()
+    except TransportError as exc:
+        if is_host_unresolvable(str(exc)):
+            # The DNS record only appears once the guest has booted, so this
+            # means down *or* still coming up. vm_status() disambiguates.
+            print(f"{YELLOW}▸{RESET} {CFG.host} does not resolve — the host is down "
+                  f"or still booting")
+        else:
+            print(f"{YELLOW}▸{RESET} cannot reach the host: {exc}")
+        if not wait_for_host():
+            sys.exit(1)
+        return snapshot()
+
+
+# -------------------------------------------------------------------- setup
+
+
+def _ask(label: str, default: str = "", *, required: bool = False) -> str:
+    """One prompt. Enter keeps the default; a lone '-' clears it."""
+    while True:
+        shown = f" [{default}]" if default else ""
+        raw = input(f"  {label}{shown}: ").strip()  # EOFError cancels setup
+        if raw == "-":
+            return ""
+        value = raw or default
+        if value or not required:
+            return value
+        print(f"  {YELLOW}this one is required{RESET}")
+
+
+def _ask_yes(label: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    try:
+        raw = input(f"  {label} [{hint}]: ").strip().lower()
+    except EOFError:
+        return False  # nobody there to say yes
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+def _ask_pattern(label: str, default: str) -> str:
+    while True:
+        value = _ask(label, default)
+        if not value:
+            return ""
+        try:
+            re.compile(value)
+        except re.error as exc:
+            print(f"  {YELLOW}not a valid regex: {exc}{RESET}")
+            continue
+        return value
+
+
+def run_setup(path: str) -> int:
+    """Interactive config. Values from an existing file are offered as defaults."""
+    cur = load_config(path) or Config()
+    print(f"\n{GREEN}vmux setup{RESET}  {DIM}writes {path}{RESET}")
+    print(f"{DIM}  Enter keeps the value in brackets, '-' clears it. Any value may "
+          f"use {{user}} for your local username.{RESET}\n")
+    try:
+        cfg = Config()
+        print("Where do your sessions run?")
+        cfg.host = _ask("ssh host (anything `ssh` accepts, aliases included)",
+                        cur.host, required=True)
+        cfg.workdir = _ask("working directory for new sessions, expanded there",
+                           cur.workdir or "$HOME")
+
+        print("\nHow should Claude be started?")
+        cfg.claude_model = _ask("claude --model (blank = Claude's own default)",
+                                cur.claude_model)
+        cfg.claude_flags = _ask("extra claude flags", cur.claude_flags)
+
+        print("\nCan the machine be stopped and started, like a cloud VM?")
+        if _ask_yes("configure VM start/stop handling", bool(cur.vm_status_command)):
+            print(f"{DIM}  vmux runs the status command locally and matches its "
+                  f"output against two regexes. If neither matches, it waits "
+                  f"without starting anything.{RESET}")
+            cfg.vm_status_command = _ask("status command (prints the VM state)",
+                                         cur.vm_status_command, required=True)
+            cfg.vm_running_pattern = _ask_pattern("regex meaning running",
+                                                  cur.vm_running_pattern)
+            cfg.vm_stopped_pattern = _ask_pattern("regex meaning stopped",
+                                                  cur.vm_stopped_pattern)
+            cfg.vm_start_command = _ask("start command (blank = never auto-start)",
+                                        cur.vm_start_command)
+
+        print("\nWhen ssh authentication fails:")
+        cfg.login_command = _ask("command to suggest, e.g. an SSO login (blank = none)",
+                                 cur.login_command)
+        # Advanced keys are carried over from an existing file, not asked for.
+        cfg.auth_fatal_markers = list(cur.auth_fatal_markers)
+        cfg.auth_fatal_hint = cur.auth_fatal_hint
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n{DIM}  cancelled; nothing written{RESET}")
+        return 1
+
+    save_config(path, cfg)
+    print(f"\n{GREEN}✔{RESET} wrote {path}")
+
+    if _ask_yes("test the ssh connection now", True):
+        host = expand_user_placeholder(cfg.host, quoted=False)
+        cp = subprocess.run(
+            ["ssh", *SSH_OPTS, "-o", "BatchMode=yes", host, "tmux -V"],
+            capture_output=True, text=True,
+        )
+        if cp.returncode == 0:
+            print(f"  {GREEN}✔{RESET} {host} answers; {cp.stdout.strip() or 'tmux found'}")
+        else:
+            err = cp.stderr.strip()
+            last = err.splitlines()[-1] if err else f"ssh exited {cp.returncode}"
+            print(f"  {YELLOW}▸{RESET} {host}: {last}")
+            print(f"  {DIM}fine if a login is needed first — vmux will ask for "
+                  f"it when you run it{RESET}")
+    return 0
+
+
+def install_config(src: str, path: str) -> int:
+    """Copy a shared config into place, checking that it parses first."""
+    try:
+        with open(src, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"{RED}✖{RESET} can't read {src}: {exc}")
+        return 1
+    if not isinstance(raw, dict):
+        print(f"{RED}✖{RESET} {src} should hold a JSON object")
+        return 1
+    cfg = parse_config(raw, src)  # exits if bad, before anything is written
+    # Store the file's own values, not the expanded ones, so {user} keeps
+    # working for whoever this laptop belongs to.
+    save_config(path, Config(**{k: v for k, v in raw.items() if k in CONFIG_FIELDS}))
+    print(f"{GREEN}✔{RESET} installed {src} as {path}")
+    print(f"  host: {cfg.host or '(none — run vmux setup)'}")
+    return 0
+
+
+# ---------------------------------------------------------------------- main
+
+
+def main() -> int:
+    global CFG
+    locale.setlocale(locale.LC_ALL, "")
+    parser = argparse.ArgumentParser(
+        prog="vmux",
+        description="A picker for Claude Code tmux sessions on a remote machine.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "commands:\n"
+            "  vmux setup [--from FILE]   write the config interactively, or copy FILE in\n"
+            "  vmux config                print the config path and effective values\n"
+            "\n"
+            f"config file: {default_config_path()}\n"
+            f"             (override with --config PATH or ${CONFIG_ENV})"
+        ),
+    )
+    parser.add_argument("command", nargs="?", choices=("setup", "config"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--from", dest="from_file", metavar="FILE",
+                        help="with setup: install FILE as the config instead of asking")
+    parser.add_argument("--config", metavar="PATH", help="config file to use")
+    parser.add_argument("-p", "--pick", action="store_true",
+                        help="accepted and ignored; the picker is always shown")
+    parser.add_argument("-s", "--shell", action="store_true",
+                        help="with -n, make a plain shell session (no Claude)")
+    parser.add_argument("-n", "--new", nargs="?", const="", metavar="NAME",
+                        help="create NAME and attach; bare -n names it after Claude")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="print sessions and exit")
+    parser.add_argument("--no-restore", action="store_true",
+                        help="don't rebuild sessions lost to a VM shutdown")
+    args = parser.parse_args()
+
+    path = args.config or os.environ.get(CONFIG_ENV) or default_config_path()
+
+    if args.command == "setup":
+        if args.from_file:
+            return install_config(args.from_file, path)
+        return run_setup(path)
+
+    cfg = load_config(path)
+    if cfg is None:
+        print(f"{DIM}  no config at {path} yet; let's write one{RESET}")
+        if run_setup(path) != 0:
+            return 1
+        cfg = load_config(path)
+        if cfg is None:
+            return 1
+    CFG = cfg
+
+    if args.command == "config":
+        print(f"{DIM}# {path}{RESET}")
+        print(json.dumps({k: getattr(CFG, k) for k in CONFIG_FIELDS}, indent=2))
+        return 0
+
+    if not CFG.host:
+        print(f"{RED}✖{RESET} no host configured; run {DIM}vmux setup{RESET}")
+        return 2
+
+    preflight()
+
+    if args.list:
+        for s in fetch()[0]:
+            state = "attached" if s.attached else f"idle {human_idle(s.idle)}"
+            print(f"{s.name:<24} {s.windows:>2} win  {state}")
+        return 0
+
+    if args.new is not None:
+        auto = args.new == ""
+        name = auto_name() if auto else normalize_name(args.new)
+        if not valid_name(name):
+            print(f"{RED}✖{RESET} names may use letters, digits, - and _ only")
+            return 2
+        try:
+            if args.shell:
+                create_plain_session(name)
+                claude_id = None
+            else:
+                _, records = fetch()
+                _, rec = create_session(name, auto_rename=auto)
+                save_records(records + [rec])
+                claude_id = rec["claude_id"]
+        except RuntimeError as exc:
+            print(f"{RED}✖{RESET} {exc}")
+            return 1
+        # Detaching falls through to the picker rather than exiting, so where
+        # you land after C-b d doesn't depend on how the tab was launched.
+        attach_with_reconnect(name, claude_id)
+
+    sessions, records = fetch()
+
+    # Anything vmux made that the VM shutdown took gets rebuilt, with its Claude
+    # conversation resumed rather than started over.
+    alive, missing = reconcile(sessions, records)
+    if missing and not args.no_restore:
+        restored = restore_missing(missing, sessions)
+        save_records(alive + restored)
+        if restored:
+            sessions, records = fetch()
+    elif len(alive) != len(records):
+        save_records(alive)  # prune records for sessions killed elsewhere
+
+    note = ""
+
+    # Nothing running: an empty picker is a dead end, so just make the session.
+    # Startup only — doing this inside the loop would mean killing your last
+    # session from the picker instantly conjures another one you can't escape.
+    if not sessions:
+        name = auto_name()
+        print(f"{DIM}  no sessions on the host; creating {name}{RESET}")
+        try:
+            _, rec = create_session(name, auto_rename=True)
+            save_records(records + [rec])
+        except RuntimeError as exc:
+            print(f"{RED}✖{RESET} {exc}")
+            return 1
+        attach_with_reconnect(name, rec["claude_id"])
+        # Re-read before the picker: `sessions` is still the empty list that
+        # sent us down this branch, so the loop would render nothing.
+        sessions, records = fetch()
+
+    while True:
+        action, payload = curses.wrapper(picker, sessions, note)
+        note = ""
+
+        if action == "quit":
+            return 0
+        if action == "attach":
+            # Outside curses, so the terminal is fully restored before ssh -t.
+            picked = next((s for s in sessions if s.name == payload), None)
+            attach_with_reconnect(payload, picked.claude_id if picked else None)
+        elif action in ("new", "new-auto"):
+            auto = action == "new-auto"
+            name = auto_name() if auto else payload
+            try:
+                _, rec = create_session(name, auto_rename=auto)
+                save_records(records + [rec])
+                attach_with_reconnect(name, rec["claude_id"])
+            except RuntimeError as exc:
+                note = str(exc)
+        elif action == "kill":
+            try:
+                kill_session(payload)
+                # Drop the record too, or the next run would resurrect it.
+                gone = {s.claude_id for s in sessions if s.name == payload}
+                save_records([r for r in records
+                              if r.get("claude_id") not in gone])
+                note = f"killed {payload}"
+            except RuntimeError as exc:
+                note = str(exc)
+        elif action == "rename":
+            old, new = payload
+            try:
+                rename_session(old, new)
+                note = f"renamed {old} → {new}"
+            except RuntimeError as exc:
+                note = str(exc)
+
+        sessions, records = fetch()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
