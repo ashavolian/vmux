@@ -35,7 +35,9 @@ What it does for you:
   instead of looping a browser login flow.
 
 It is one stdlib-only Python file. The host needs nothing beyond tmux and
-Claude Code.
+Claude Code. Or, if you already run [herdr](https://herdr.dev) on the host,
+vmux can hand the sessions to it and keep only the getting-there part; see
+[Using herdr instead of the picker](#using-herdr-instead-of-the-picker).
 
 ## Requirements
 
@@ -144,6 +146,8 @@ vmux setup --from team-config.json
 | `vm_running_pattern`  | blank    | Regex; if it matches the status output, the VM is running. |
 | `vm_stopped_pattern`  | blank    | Regex; if it matches, the VM is stopped and `vm_start_command` runs. If a group is present, its text is shown in messages. |
 | `vm_start_command`    | blank    | Local shell command that starts the VM. Blank means vmux only waits. |
+| `multiplexer`         | `tmux`   | `tmux` for vmux's own picker, `herdr` to hand sessions to herdr on the host. |
+| `herdr_command`       | `herdr`  | Remote command that opens herdr, run through your login shell. |
 | `login_command`       | blank    | Suggested to you when ssh authentication fails. Never executed. |
 | `auth_fatal_markers`  | `[]`     | Extra ssh stderr substrings that mean retrying won't help, on top of the built-in `address already in use`. |
 | `auth_fatal_hint`     | blank    | Free text printed alongside such an error, e.g. how to find the process holding a port. |
@@ -166,6 +170,7 @@ vmux --no-restore   don't rebuild sessions lost to a host shutdown
 vmux setup          write or edit the config
 vmux config         show the config in effect
 vmux --help         everything above, plus the config path
+vmux --multiplexer tmux|herdr   override the configured multiplexer once
 ```
 
 Picker keys: `↵` attach, `n` new, `x` kill, `r` rename, `g` refresh,
@@ -175,7 +180,56 @@ you back to the picker.
 Names are prefixed `claude-` automatically. If there are no sessions at all,
 vmux creates one and attaches rather than showing an empty picker.
 
+## Using herdr instead of the picker
+
+[herdr](https://herdr.dev) is an open-source multiplexer built for coding
+agents. It runs a background server on the host that owns the agent
+terminals, shows each agent as working, blocked, or idle, restores its layout
+after a restart, and, with its Claude integration installed, resumes the
+conversations. That is most of what vmux's picker, rename watcher, and
+restore logic do, so with herdr on the host vmux drops them and keeps only
+the part herdr has no opinion on: making the host reachable. VM start,
+certificate warnings, and the reconnect loop still work exactly as before.
+
+On the host, once:
+
+```sh
+brew install herdr            # or: curl -fsSL https://herdr.dev/install.sh | sh
+herdr integration install claude
+```
+
+The integration adds one hook script under `~/.claude/hooks/` and matching
+`SessionStart` entries to Claude Code's settings so herdr learns each
+conversation's id and can `claude --resume` it after a restart. It is not
+needed for status detection. `herdr integration uninstall claude` removes it.
+
+On your laptop, run `vmux setup` and answer `herdr` to the multiplexer
+question. Then:
+
+```
+vmux              attach to herdr on the host; ctrl+b q detaches
+vmux -n NAME      open a workspace called claude-NAME with Claude already
+                  running in it, then attach
+vmux -n           the same, with a timestamp name
+vmux -n NAME -s   a workspace with just a shell
+vmux -l           list herdr's agents and their states
+```
+
+`vmux -n` starts Claude with the model and flags from your config, so your
+`claude_model` and `claude_flags` still apply. Inside herdr you can also open
+panes and start `claude` yourself; vmux doesn't mind.
+
+Sessions you started in tmux mode stay in tmux. Reach them with
+`vmux --multiplexer tmux` until they finish.
+
+What vmux stops doing in this mode: the curses picker, the tmux session
+records in `~/.local/state/vmux/`, and the rename watcher. herdr does not name
+agents after their task, so a `vmux -n` without a name gets a timestamp label;
+rename it in herdr if you like.
+
 ## How it works
+
+In tmux mode:
 
 - Sessions are created detached, then Claude is started with `tmux send-keys`.
   The login shell outlives Claude, so when a job finishes the window stays put
@@ -234,8 +288,8 @@ python3 -m unittest discover -s tests
 ```
 
 The tests cover config loading, `{user}` expansion and quoting, the Claude
-command line, VM state classification, and auth error matching. Nothing in
-them touches the network.
+command line, VM state classification, auth error matching, and the herdr
+helpers. Nothing in them touches the network.
 
 ## Updating
 

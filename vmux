@@ -15,6 +15,11 @@ closed is still going (with its scrollback) when you reattach.
 
 Everything machine-specific — the host, how to start a stopped VM, how to log
 in again — lives in a config file written by `vmux setup`.
+
+With `"multiplexer": "herdr"` the picker, watcher and restore logic step aside:
+herdr (herdr.dev) owns the sessions on the host and vmux only gets you there
+and back — VM start, certificate warnings, reconnect — plus `-n` to open a
+workspace with Claude already running in it.
 """
 
 from __future__ import annotations
@@ -71,6 +76,12 @@ class Config:
     vm_running_pattern: str = ""
     vm_stopped_pattern: str = ""
     vm_start_command: str = ""
+    # What owns the sessions on the host: "tmux" (vmux's own picker) or
+    # "herdr" (herdr.dev's agent multiplexer, installed on the host).
+    multiplexer: str = "tmux"
+    # Remote command that opens herdr. Run through a login shell so it is
+    # found wherever the installer put it (~/.local/bin, linuxbrew, ...).
+    herdr_command: str = "herdr"
     # Shown (never run) when ssh authentication fails, e.g. an SSO login.
     login_command: str = ""
     # Extra ssh stderr substrings that mean "retrying won't help", plus a hint
@@ -81,6 +92,13 @@ class Config:
     @property
     def has_vm_control(self) -> bool:
         return bool(self.vm_status_command)
+
+    @property
+    def uses_herdr(self) -> bool:
+        return self.multiplexer == "herdr"
+
+
+MULTIPLEXERS = ("tmux", "herdr")
 
 
 CONFIG_FIELDS = tuple(Config.__dataclass_fields__)
@@ -131,6 +149,9 @@ def parse_config(raw, path: str) -> Config:
             sys.exit(f"{RED}✖{RESET} {path}: {key} must be {want}")
         known[key] = expand_user_placeholder(value, quoted=key in COMMAND_FIELDS)
     cfg = Config(**known)
+    if cfg.multiplexer not in MULTIPLEXERS:
+        sys.exit(f"{RED}✖{RESET} {path}: multiplexer must be one of "
+                 f"{', '.join(MULTIPLEXERS)}")
     for name in ("vm_running_pattern", "vm_stopped_pattern"):
         pattern = getattr(cfg, name)
         if pattern:
@@ -586,8 +607,13 @@ def claude_cmd(claude_id: str, resume: bool) -> str:
     whole line for ssh (as spawn_session does) does not protect this inner
     shell.
     """
+    return f"claude {claude_args(claude_id, resume)}"
+
+
+def claude_args(claude_id: str, resume: bool) -> str:
+    """Everything after `claude`, quoted for an interactive shell."""
     flag = "--resume" if resume else "--session-id"
-    parts = [f"claude {flag} {claude_id}"]
+    parts = [f"{flag} {claude_id}"]
     if CFG.claude_model:
         parts.append(f"--model {shlex.quote(CFG.claude_model)}")
     if CFG.claude_flags:
@@ -891,6 +917,238 @@ def attach_with_reconnect(name: str, claude_id: str | None = None) -> None:
         announce = True
 
 
+# ---------------------------------------------------------------------- herdr
+#
+# herdr keeps a background server on the host that owns the agent terminals,
+# shows each agent's state, restores its layout after a restart and (with its
+# Claude integration installed) resumes the conversations. So in this mode
+# vmux does none of that; it makes the host reachable and attaches.
+
+
+def remote_login(cmd: str) -> str:
+    """Run a remote command through the user's login shell, so PATH additions
+    made in profile files (linuxbrew, ~/.local/bin) apply to it."""
+    return f'exec "$SHELL" -lc {shlex.quote(cmd)}'
+
+
+def herdr_run(argstr: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return ssh_capture(remote_login(f"{CFG.herdr_command} {argstr}"), timeout=timeout)
+
+
+def herdr_error(stderr: str, stdout: str = "") -> str:
+    """herdr reports control errors as one JSON object on stderr."""
+    text = stderr.strip() or stdout.strip()
+    if not text:
+        return ""
+    last = text.splitlines()[-1]
+    try:
+        data = json.loads(last)
+    except ValueError:
+        return last
+    err = data.get("error", data) if isinstance(data, dict) else data
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or last)
+    return str(err)
+
+
+def herdr_json(argstr: str, timeout: int = 60):
+    """Run a herdr control command and decode its JSON reply."""
+    cp = herdr_run(argstr, timeout)
+    if cp.returncode == SSH_TRANSPORT_ERROR:
+        raise TransportError(cp.stderr.strip() or "ssh exited 255")
+    if cp.returncode != 0:
+        raise RuntimeError(herdr_error(cp.stderr, cp.stdout)
+                           or f"herdr exited {cp.returncode}")
+    try:
+        return json.loads(cp.stdout)
+    except ValueError:
+        raise RuntimeError(f"unexpected reply from herdr: {cp.stdout.strip()[:200]}")
+
+
+def herdr_id(value, *keys: str) -> str:
+    """Ids come back bare or wrapped in an object; accept both."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in keys:
+            if isinstance(value.get(key), str):
+                return value[key]
+    return ""
+
+
+def herdr_result(data) -> dict:
+    if isinstance(data, dict):
+        inner = data.get("result", data)
+        return inner if isinstance(inner, dict) else {}
+    return {}
+
+
+def herdr_agent_name(name: str) -> str:
+    """herdr agent names must match [a-z][a-z0-9_-]{0,31}."""
+    slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-")
+    if not slug:
+        return "claude"
+    if not slug[0].isalpha():
+        slug = "c-" + slug
+    return slug[:32].rstrip("-")
+
+
+def ensure_herdr_server() -> None:
+    """Control commands need a running server. The interactive `herdr` would
+    start one, but not without a terminal, so start it headless here."""
+    h = shlex.quote(CFG.herdr_command)
+    script = (
+        f'if ! {h} status server 2>/dev/null | grep -q "status: running"; then '
+        f'setsid {h} server </dev/null >/dev/null 2>&1 & '
+        f'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do '
+        f'sleep 0.5; {h} status server 2>/dev/null | grep -q "status: running" && break; '
+        f'done; fi; {h} status server'
+    )
+    cp = ssh_capture(remote_login(script), timeout=45)
+    if cp.returncode == SSH_TRANSPORT_ERROR:
+        raise TransportError(cp.stderr.strip() or "ssh exited 255")
+    if "status: running" not in cp.stdout:
+        detail = (cp.stderr.strip() or cp.stdout.strip()).splitlines()
+        raise RuntimeError("herdr server did not start on the host"
+                           + (f": {detail[-1]}" if detail else
+                              f". Is `{CFG.herdr_command}` installed there?"))
+
+
+def herdr_new(name: str, *, shell_only: bool = False) -> str:
+    """Open a workspace named after the session and start Claude in its root
+    pane. Returns the agent name, or "" for a plain shell workspace."""
+    ensure_herdr_server()
+    created = herdr_json(
+        f"workspace create --cwd {CFG.workdir} --label {shlex.quote(name)}"
+    )
+    pane = herdr_id(herdr_result(created).get("root_pane"), "pane_id", "id")
+    if not pane:
+        raise RuntimeError("herdr created the workspace but reported no root "
+                           f"pane: {json.dumps(created)[:200]}")
+    if shell_only:
+        return ""
+    agent = herdr_agent_name(name)
+    # A fresh pane needs a moment to reach its prompt before an agent can
+    # start in it; agent start then waits (30s default) until Claude is ready.
+    time.sleep(1.5)
+    herdr_json(
+        f"agent start {shlex.quote(agent)} --kind claude --pane {shlex.quote(pane)} "
+        f"-- {claude_args(str(uuid.uuid4()), resume=False)}",
+        timeout=75,
+    )
+    return agent
+
+
+def herdr_list() -> int:
+    """`vmux -l` in herdr mode: the agents herdr knows about."""
+    cp = herdr_run("status server", timeout=30)
+    if cp.returncode == SSH_TRANSPORT_ERROR:
+        print(f"{RED}✖{RESET} cannot reach the host: {cp.stderr.strip()}")
+        return 1
+    if "status: running" not in cp.stdout:
+        print(f"{DIM}  herdr server is not running on the host; nothing to list{RESET}")
+        return 0
+    try:
+        data = herdr_json("agent list")
+    except RuntimeError as exc:
+        print(f"{RED}✖{RESET} {exc}")
+        return 1
+    for line in format_herdr_agents(data):
+        print(line)
+    return 0
+
+
+def format_herdr_agents(data) -> list:
+    """One line per agent from herdr's `agent list` reply, which looks like
+    {"result": {"agents": [{"name", "agent", "agent_status", "pane_id",
+    "cwd", ...}]}}. Unnamed agents show their pane id instead."""
+    agents = herdr_result(data).get("agents")
+    if not isinstance(agents, list) or not agents:
+        return [f"{DIM}  no agents running{RESET}"]
+    lines = []
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or a.get("pane_id") or "?")
+        kind = str(a.get("agent") or "")
+        state = str(a.get("agent_status") or "")
+        cwd = str(a.get("cwd") or "")
+        lines.append(f"{name:<24} {kind:<8} {state:<8} {cwd}")
+    return lines
+
+
+def herdr_attach() -> int:
+    """Hand the terminal to herdr on the host. ctrl+b q detaches."""
+    return subprocess.call(
+        ["ssh", "-t", *SSH_OPTS, CFG.host, remote_login(CFG.herdr_command)]
+    )
+
+
+def herdr_session() -> None:
+    """Attach to herdr and keep re-attaching while the drop looks like sleep."""
+    announce = False
+    while True:
+        if announce:
+            print(f"{GREEN}✔{RESET} reattached to herdr")
+            announce = False
+        started = time.monotonic()
+        rc = herdr_attach()
+        lasted = time.monotonic() - started
+        if rc == 0:
+            return
+        if rc != SSH_TRANSPORT_ERROR:
+            print(f"{RED}✖{RESET} herdr exited with status {rc}.")
+            if lasted < 5:
+                print(f"  Check it by hand: {DIM}ssh {CFG.host} "
+                      f"{shlex.quote(remote_login(CFG.herdr_command + ' status'))}{RESET}")
+            return
+        if lasted > 5:
+            print(f"\n{YELLOW}▸{RESET} connection dropped")
+        else:
+            print(f"{YELLOW}▸{RESET} cannot reach the host")
+        try:
+            if not wait_for_host():
+                return
+        except KeyboardInterrupt:
+            print(f"\n{DIM}  gave up reconnecting; herdr is still running on "
+                  f"the host{RESET}")
+            return
+        announce = True
+
+
+def herdr_main(args) -> int:
+    if args.list:
+        return herdr_list()
+
+    # herdr's own commands can't start a VM, so reach the host first.
+    ok, err = ssh_probe()
+    if not ok:
+        if is_host_unresolvable(err):
+            print(f"{YELLOW}▸{RESET} {CFG.host} does not resolve — the host is "
+                  f"down or still booting")
+        else:
+            print(f"{YELLOW}▸{RESET} cannot reach the host: "
+                  f"{err.splitlines()[-1] if err else 'no answer'}")
+        if not wait_for_host():
+            return 1
+
+    if args.new is not None:
+        name = auto_name() if args.new == "" else normalize_name(args.new)
+        if not valid_name(name):
+            print(f"{RED}✖{RESET} names may use letters, digits, - and _ only")
+            return 2
+        try:
+            agent = herdr_new(name, shell_only=args.shell)
+        except (RuntimeError, TransportError) as exc:
+            print(f"{RED}✖{RESET} {exc}")
+            return 1
+        what = "shell workspace" if args.shell else f"workspace, Claude running as {agent}"
+        print(f"{GREEN}✔{RESET} {name}: {what}")
+
+    herdr_session()
+    return 0
+
+
 # ------------------------------------------------------------------ curses UI
 
 KEY_ESC = 27
@@ -1133,6 +1391,14 @@ def _ask_yes(label: str, default: bool) -> bool:
     return raw in ("y", "yes")
 
 
+def _ask_choice(label: str, choices: tuple, default: str) -> str:
+    while True:
+        value = _ask(f"{label} ({'/'.join(choices)})", default, required=True)
+        if value in choices:
+            return value
+        print(f"  {YELLOW}pick one of: {', '.join(choices)}{RESET}")
+
+
 def _ask_pattern(label: str, default: str) -> str:
     while True:
         value = _ask(label, default)
@@ -1159,6 +1425,18 @@ def run_setup(path: str) -> int:
                         cur.host, required=True)
         cfg.workdir = _ask("working directory for new sessions, expanded there",
                            cur.workdir or "$HOME")
+
+        print("\nWhat manages the sessions on the host?")
+        print(f"{DIM}  tmux: vmux's own picker, nothing extra to install. herdr: "
+              f"herdr.dev's agent multiplexer, installed on the host; vmux then "
+              f"only gets you there and back.{RESET}")
+        cfg.multiplexer = _ask_choice("multiplexer", MULTIPLEXERS,
+                                      cur.multiplexer or "tmux")
+        if cfg.multiplexer == "herdr":
+            cfg.herdr_command = _ask("herdr command on the host",
+                                     cur.herdr_command or "herdr") or "herdr"
+        else:
+            cfg.herdr_command = cur.herdr_command or "herdr"
 
         print("\nHow should Claude be started?")
         cfg.claude_model = _ask("claude --model (blank = Claude's own default)",
@@ -1237,7 +1515,8 @@ def main() -> int:
     locale.setlocale(locale.LC_ALL, "")
     parser = argparse.ArgumentParser(
         prog="vmux",
-        description="A picker for Claude Code tmux sessions on a remote machine.",
+        description="A picker for Claude Code sessions on a remote machine, "
+                    "in tmux or herdr.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "commands:\n"
@@ -1253,6 +1532,8 @@ def main() -> int:
     parser.add_argument("--from", dest="from_file", metavar="FILE",
                         help="with setup: install FILE as the config instead of asking")
     parser.add_argument("--config", metavar="PATH", help="config file to use")
+    parser.add_argument("--multiplexer", choices=MULTIPLEXERS, metavar="tmux|herdr",
+                        help="override the configured multiplexer for this run")
     parser.add_argument("-p", "--pick", action="store_true",
                         help="accepted and ignored; the picker is always shown")
     parser.add_argument("-s", "--shell", action="store_true",
@@ -1281,6 +1562,8 @@ def main() -> int:
         if cfg is None:
             return 1
     CFG = cfg
+    if args.multiplexer:
+        CFG.multiplexer = args.multiplexer
 
     if args.command == "config":
         print(f"{DIM}# {path}{RESET}")
@@ -1292,6 +1575,9 @@ def main() -> int:
         return 2
 
     preflight()
+
+    if CFG.uses_herdr:
+        return herdr_main(args)
 
     if args.list:
         for s in fetch()[0]:
