@@ -52,4 +52,4 @@ else
 fi
 
 echo
-echo "run 'vmux' to open the picker. Optional short alias for your shell rc:  alias vmc=vmux"
+echo "run 'vmux' to attach to herdr on your host. Optional short alias for your shell rc:  alias vmc=vmux"
