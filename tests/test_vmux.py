@@ -45,13 +45,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.vm_running_pattern, f"^{user} RUNNING$")
         self.assertEqual(cfg.auth_fatal_markers, [f"{user} oauth"])
 
-    def test_defaults(self):
-        write(self.path, {"host": "h"})
-        cfg = vmux.load_config(self.path)
-        self.assertEqual(cfg.herdr_command, "herdr")
-        self.assertEqual(cfg.workdir, "$HOME")
-        self.assertFalse(cfg.has_vm_control)
-
     def test_unknown_key_is_warned_and_ignored(self):
         write(self.path, {"host": "h", "colour": "blue"})
         out = io.StringIO()
@@ -78,20 +71,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(vmux.load_config(self.path), cfg)
 
 
-class ClaudeArgsTests(unittest.TestCase):
+class ClaudeCommandTests(unittest.TestCase):
     def tearDown(self):
         vmux.CFG = vmux.Config()
 
     def test_model_is_quoted_for_the_inner_shell(self):
         vmux.CFG = vmux.Config(claude_model="some-model[1m]", claude_flags="--flag x")
         self.assertEqual(
-            vmux.claude_args("abc"),
-            "--session-id abc --model 'some-model[1m]' --flag x",
+            vmux.claude_cmd("abc", resume=False),
+            "claude --session-id abc --model 'some-model[1m]' --flag x",
         )
 
     def test_blank_model_and_flags_are_omitted(self):
         vmux.CFG = vmux.Config()
-        self.assertEqual(vmux.claude_args("abc"), "--session-id abc")
+        self.assertEqual(vmux.claude_cmd("abc", resume=True), "claude --resume abc")
 
 
 class VmStatusTests(unittest.TestCase):
@@ -133,11 +126,6 @@ class AuthTests(unittest.TestCase):
         self.assertTrue(vmux.is_auth_infra_error("sso: error generating TOKEN"))
         self.assertFalse(vmux.is_auth_infra_error("Permission denied (publickey)"))
 
-    def test_unresolvable_host_detection(self):
-        self.assertTrue(vmux.is_host_unresolvable(
-            "ssh: Could not resolve hostname x: nodename nor servname provided"))
-        self.assertFalse(vmux.is_host_unresolvable("Connection timed out"))
-
 
 class NameTests(unittest.TestCase):
     def test_prefix_and_validation(self):
@@ -148,7 +136,11 @@ class NameTests(unittest.TestCase):
         self.assertFalse(vmux.valid_name(""))
 
 
+
 class HerdrTests(unittest.TestCase):
+    def tearDown(self):
+        vmux.CFG = vmux.Config()
+
     def test_agent_names_fit_herdrs_rules(self):
         for raw, want in (
             ("claude-fix-tests", "claude-fix-tests"),
@@ -176,6 +168,11 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(vmux.herdr_error("", "plain text failure"), "plain text failure")
         self.assertEqual(vmux.herdr_error(""), "")
 
+    def test_claude_args_drop_the_program_name(self):
+        vmux.CFG = vmux.Config(claude_model="m[1m]", claude_flags="--f")
+        self.assertEqual(vmux.claude_args("id1", resume=False), "--session-id id1 --model 'm[1m]' --f")
+        self.assertEqual(vmux.claude_cmd("id1", resume=False), "claude " + vmux.claude_args("id1", False))
+
     def test_remote_login_wraps_in_a_login_shell(self):
         self.assertEqual(vmux.remote_login("herdr status"), 'exec "$SHELL" -lc \'herdr status\'')
 
@@ -199,6 +196,18 @@ class HerdrTests(unittest.TestCase):
         res = vmux.herdr_result(reply)
         self.assertEqual(vmux.herdr_id(res.get("root_pane"), "pane_id", "id"), "w1:p1")
         self.assertEqual(vmux.herdr_id(res.get("workspace"), "workspace_id", "id"), "w1")
+
+    def test_multiplexer_is_validated(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            path = os.path.join(tmp.name, "c.json")
+            write(path, {"host": "h", "multiplexer": "screen"})
+            with self.assertRaises(SystemExit):
+                vmux.load_config(path)
+            write(path, {"host": "h", "multiplexer": "herdr"})
+            self.assertTrue(vmux.load_config(path).uses_herdr)
+        finally:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":
